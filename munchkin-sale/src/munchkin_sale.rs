@@ -3,15 +3,14 @@
 elrond_wasm::imports!();
 
 const EGLD_DECIMALS_VALUE: u64 = 1_000_000_000_000_000_000;
-
+const INITIAL_AMOUNT: u64 = 0;
 /// A contract that allows anyone to by a Munchkin token in a public sale.
 #[elrond_wasm::contract]
 pub trait MunchkinSale {
     /// Necessary configuration when deploying:
     /// `max_amount` - max amount of EGLD that can be used to buy $MUNCHKIN.  
     /// `min_amount` - min amount of EGLD that can be used to buy $MUNCHKIN.  
-    /// `initial_price` - price for $MUNCHKIN token in EGLD (how much $MUNCHKIN for 1 EGLD) 
-    /// `price_increase` - increasement of price after each successful transaction 
+    /// `initial_price` - price for $MUNCHKIN token in EGLD (how much $MUNCHKIN for 1 EGLD)
     /// `token_id` - $MUNCHKIN token ID.
     #[init]
     fn init(
@@ -19,13 +18,11 @@ pub trait MunchkinSale {
         max_amount: Self::BigUint,
         min_amount: Self::BigUint,
         initial_price: Self::BigUint,
-        price_increase: Self::BigUint,
         #[var_args] opt_token_id: OptionalArg<TokenIdentifier>,
     ) -> SCResult<()> {
         require!(max_amount > 0, "Max amount cannot be set to zero");
         require!(min_amount > 0, "Min amount cannot be set to zero");
         require!(initial_price > 0, "Initial price cannot be set to zero");
-        require!(price_increase > 0, "Increasement price cannot be set to zero");
 
         let token_id = opt_token_id
             .into_option()
@@ -43,9 +40,11 @@ pub trait MunchkinSale {
 
         self.min_amount().set(&min_amount);
 
-        self.increase_amount().set(&price_increase);
-
         self.sale_token_id().set(&token_id);
+
+        let initial_amount = Self::BigUint::from(INITIAL_AMOUNT);
+
+        self.balance_amount().set(&initial_amount);
 
         Ok(())
     }
@@ -56,10 +55,7 @@ pub trait MunchkinSale {
     /// Optional `_data` argument is ignored.
     #[payable("EGLD")]
     #[endpoint]
-    fn buy(
-        &self,
-        #[payment_amount] payment_amount: Self::BigUint,
-    ) -> SCResult<()> {
+    fn buy(&self, #[payment_amount] payment_amount: Self::BigUint) -> SCResult<()> {
         require!(
             payment_amount <= self.max_amount().get(),
             "The payment is too high"
@@ -69,38 +65,85 @@ pub trait MunchkinSale {
             "The payment is too low"
         );
 
-        let balance = self.blockchain().get_sc_balance(&self.sale_token_id().get(), 0);
-        require!(
-            balance > 0,
-            "No more token to sale."
-        );
+        let balance = self
+            .blockchain()
+            .get_sc_balance(&self.sale_token_id().get(), 0);
+        require!(balance > 0, "No more token to sale.");
         let current_price = self.price().get();
         let one_egld = Self::BigUint::from(EGLD_DECIMALS_VALUE);
-        let result_edst_token_amount = ( &current_price * &payment_amount ) / one_egld;
+        let result_edst_token_amount = (&current_price * &payment_amount) / one_egld;
         require!(
-            balance > result_edst_token_amount,
+            balance >= result_edst_token_amount,
             "Not enough tokens for sale."
         );
 
         //send the ESDT token amount to the user
         let caller = self.blockchain().get_caller();
         let token_id = self.sale_token_id().get();
-        self.send()
-        .direct(&caller, &token_id, 0, &result_edst_token_amount, b"Munchkin sale successful :).");
+        self.balance_amount()
+            .set(&(&self.balance_amount().get() - &result_edst_token_amount));
+        self.send().direct(
+            &caller,
+            &token_id,
+            0,
+            &result_edst_token_amount,
+            b"Munchkin sale successful :).",
+        );
 
-        if &current_price > &self.increase_amount().get() {
-            self.price().set(&(&current_price - &self.increase_amount().get()));
-        }
         Ok(())
     }
 
     /// Optional `_data` argument is ignored.
     #[payable("*")]
     #[endpoint]
-    fn deposit(
-        &self,
-        #[payment_amount] _payment_amount: Self::BigUint,
-    ) -> SCResult<()> {
+    fn deposit(&self, #[payment_amount] payment_amount: Self::BigUint) -> SCResult<()> {
+        let balance = self
+            .blockchain()
+            .get_sc_balance(&self.sale_token_id().get(), 0);
+
+        self.balance_amount()
+            .set(&(&self.balance_amount().get() + &payment_amount));
+        Ok(())
+    }
+
+    #[endpoint]
+    fn claimEgld(&self) -> SCResult<()> {
+        let caller = self.blockchain().get_caller();
+        require!(
+            caller == self.blockchain().get_owner_address(),
+            "only owner can claim"
+        );
+
+        let sc_balance = self
+            .blockchain()
+            .get_sc_balance(&TokenIdentifier::egld(), 0);
+        self.send()
+            .direct(&caller, &TokenIdentifier::egld(), 0, &sc_balance, b"claim");
+
+        Ok(())
+    }
+
+    #[endpoint]
+    fn claimEsdt(&self) -> SCResult<()> {
+        let caller = self.blockchain().get_caller();
+        require!(
+            caller == self.blockchain().get_owner_address(),
+            "only owner can claim"
+        );
+
+        let sc_balance = self
+            .blockchain()
+            .get_sc_balance(&self.sale_token_id().get(), 0);
+        let initial_amount = Self::BigUint::from(INITIAL_AMOUNT);
+
+        self.balance_amount().set(&initial_amount);
+        self.send().direct(
+            &caller,
+            &self.sale_token_id().get(),
+            0,
+            &sc_balance,
+            b"claim",
+        );
 
         Ok(())
     }
@@ -114,6 +157,9 @@ pub trait MunchkinSale {
     #[storage_get("owner")]
     fn get_owner(&self) -> Address;
 
+    #[view(getBalanceAmount)]
+    #[storage_mapper("balance_amount")]
+    fn balance_amount(&self) -> SingleValueMapper<Self::Storage, Self::BigUint>;
 
     #[view(getSaleToken)]
     #[storage_mapper("saleTokenId")]
@@ -127,12 +173,7 @@ pub trait MunchkinSale {
     #[storage_mapper("minAmount")]
     fn min_amount(&self) -> SingleValueMapper<Self::Storage, Self::BigUint>;
 
-    #[view(getIncreaseAmount)]
-    #[storage_mapper("increaseAmount")]
-    fn increase_amount(&self) -> SingleValueMapper<Self::Storage, Self::BigUint>;
-
     #[view(getPrice)]
     #[storage_mapper("price")]
     fn price(&self) -> SingleValueMapper<Self::Storage, Self::BigUint>;
-
 }
